@@ -239,7 +239,9 @@ The example script skips missing optional package SDKs. The dogfood script
 skips missing local repos and currently covers `raymarch-dd`,
 `dudu-webserver`, and `dudu-datascience` when they exist next to the Dudu
 checkout. The full validation matrix lives in
-[`docs/validation-matrix.md`](docs/validation-matrix.md).
+[`docs/validation-matrix.md`](docs/validation-matrix.md). The local multi-repo
+layout, optional reference clones, and recreation commands are documented in
+[`docs/repo-layout.md`](docs/repo-layout.md#local-development-workspace).
 
 ## Editor Support
 
