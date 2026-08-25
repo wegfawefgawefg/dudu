@@ -16,6 +16,8 @@ namespace dudu::macro {
 namespace {
 
 std::atomic<std::uint64_t> sdk_staging_counter{0};
+constexpr std::size_t max_sdk_cache_entries = 8;
+constexpr auto sdk_cache_prune_grace = std::chrono::minutes(10);
 
 using Clock = std::chrono::steady_clock;
 
@@ -67,6 +69,59 @@ const CppModuleArtifact& require_artifact(const std::vector<CppModuleArtifact>& 
         throw std::runtime_error("macro SDK artifact is missing: " + path.generic_string());
     }
     return *found;
+}
+
+struct SdkCacheEntry {
+    std::filesystem::path path;
+    std::filesystem::file_time_type modified;
+};
+
+void maintain_sdk_cache(const std::filesystem::path& cache_dir,
+                        const std::filesystem::path& current_entry) {
+    std::error_code error;
+    const auto now = std::filesystem::file_time_type::clock::now();
+    std::filesystem::last_write_time(current_entry, now, error);
+    error.clear();
+
+    std::vector<SdkCacheEntry> removable;
+    std::size_t entry_count = 0;
+    std::filesystem::directory_iterator iterator(cache_dir, error);
+    const std::filesystem::directory_iterator end;
+    while (!error && iterator != end) {
+        const std::filesystem::directory_entry candidate = *iterator;
+        iterator.increment(error);
+
+        std::error_code candidate_error;
+        if (!candidate.is_directory(candidate_error) || candidate_error ||
+            candidate.path().filename().string().find(".tmp.") != std::string::npos) {
+            continue;
+        }
+        ++entry_count;
+        if (candidate.path() == current_entry) {
+            continue;
+        }
+
+        const auto modified = candidate.last_write_time(candidate_error);
+        if (candidate_error || modified > now - sdk_cache_prune_grace) {
+            continue;
+        }
+        removable.push_back({.path = candidate.path(), .modified = modified});
+    }
+    if (entry_count <= max_sdk_cache_entries) {
+        return;
+    }
+
+    std::ranges::sort(removable, {}, &SdkCacheEntry::modified);
+    std::size_t remove_count = entry_count - max_sdk_cache_entries;
+    for (const SdkCacheEntry& candidate : removable) {
+        if (remove_count == 0) {
+            break;
+        }
+        error.clear();
+        if (std::filesystem::remove_all(candidate.path, error) > 0 && !error) {
+            --remove_count;
+        }
+    }
 }
 
 std::string sdk_identity(const std::vector<CppModuleArtifact>& artifacts,
@@ -136,6 +191,7 @@ std::filesystem::path prepare_sdk(const std::vector<CppModuleArtifact>& artifact
     if (std::filesystem::is_regular_file(object) &&
         std::filesystem::is_regular_file(bridge_object) &&
         std::filesystem::is_regular_file(precompiled_header)) {
+        maintain_sdk_cache(options.sdk_cache_dir, entry);
         return entry;
     }
     std::filesystem::create_directories(options.sdk_cache_dir);
@@ -199,10 +255,9 @@ std::filesystem::path prepare_sdk(const std::vector<CppModuleArtifact>& artifact
             entry / ("dudu_macro_sdk.hpp.gch.tmp." + std::to_string(::getpid()) + "." +
                      std::to_string(sdk_staging_counter.fetch_add(1, std::memory_order_relaxed)));
         const std::filesystem::path pch_log = temporary_pch.string() + ".log";
-        const std::string pch_command =
-            compile_prefix(options, entry, "-O0") + " -x c++-header " +
-            shell_quote_path(entry / "dudu_macro_sdk.hpp") + " -o " +
-            shell_quote_path(temporary_pch);
+        const std::string pch_command = compile_prefix(options, entry, "-O0") + " -x c++-header " +
+                                        shell_quote_path(entry / "dudu_macro_sdk.hpp") + " -o " +
+                                        shell_quote_path(temporary_pch);
         const int pch_status = run_shell_command(pch_command, pch_log);
         if (pch_status != 0) {
             const std::optional<std::string> detail = try_read_text_file(pch_log);
@@ -222,6 +277,7 @@ std::filesystem::path prepare_sdk(const std::vector<CppModuleArtifact>& artifact
         std::filesystem::remove(temporary_pch);
         std::filesystem::remove(pch_log);
     }
+    maintain_sdk_cache(options.sdk_cache_dir, entry);
     return entry;
 }
 
@@ -263,13 +319,13 @@ void compile_units_parallel(const std::filesystem::path& dir, const std::filesys
     std::vector<CommandUnit> commands;
     commands.reserve(units.size());
     for (const CompileUnit& unit : units) {
-        commands.push_back(
-            {.command = compile_prefix(options, dir, unit.optimization) +
-                        " -I" + shell_quote_path(sdk) + " -include " +
-                        shell_quote_path(sdk / "dudu_macro_sdk.hpp") + " -c " +
-                        shell_quote_path(unit.source) + " -o " + shell_quote_path(unit.object),
-             .log = unit.log,
-             .failure = "could not compile macro worker source"});
+        commands.push_back({.command = compile_prefix(options, dir, unit.optimization) + " -I" +
+                                       shell_quote_path(sdk) + " -include " +
+                                       shell_quote_path(sdk / "dudu_macro_sdk.hpp") + " -c " +
+                                       shell_quote_path(unit.source) + " -o " +
+                                       shell_quote_path(unit.object),
+                            .log = unit.log,
+                            .failure = "could not compile macro worker source"});
     }
     run_commands_parallel(commands);
 }
